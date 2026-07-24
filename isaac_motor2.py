@@ -1,0 +1,257 @@
+"""
+=====================================================================
+  AK70-10 KV100 — dynamic motor simulation, Isaac Sim 5.1
+  VERSION 2: no URDF importer. Articulation built directly in USD.
+=====================================================================
+The URDF importer was implicated in a hard PhysX abort (heap corruption
+inside libomni.physx during World.reset()).  This version never touches
+it: base link, output link and the revolute joint are authored straight
+onto the stage with UsdPhysics / PhysxSchema.
+
+Stage markers S1..S8 are printed with flush=True, so if it still aborts
+the last marker tells you exactly where.
+
+Run:  /isaac-sim/python.sh -u isaac_motor2.py
+=====================================================================
+"""
+import math, csv
+
+# ------------------------------------------------------------ boot Isaac
+from isaacsim import SimulationApp
+app = SimulationApp({"headless": True})
+print("S1 app ok", flush=True)
+
+import numpy as np
+from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf, Sdf
+from isaacsim.core.api import World
+from isaacsim.core.utils.stage import get_current_stage
+from isaacsim.core.prims import SingleArticulation
+from isaacsim.core.utils.types import ArticulationAction
+
+# ------------------------------------------- AK70-10 KV100 (datasheet)
+GEAR         = 10.0
+ARMATURE     = 7.534788e-05 * GEAR**2   # 7.5348e-3 kg*m^2 at the output
+PEAK_TORQUE  = 24.8                     # Nm
+RATED_TORQUE = 8.3                      # Nm
+NOLOAD_SPEED = 480 / 60 * 2 * math.pi   # 50.27 rad/s
+FRICTION     = 0.48                     # Nm back-drive
+KT_OUT       = 0.123 * GEAR             # 1.23 Nm/A
+HZ           = 1000
+
+SHAFT_Z      = 0.025125                 # joint offset along the axis
+
+ROOT   = "/World/ak70"
+BASE   = ROOT + "/base_link"
+OUTPUT = ROOT + "/output_link"
+JOINT  = ROOT + "/joint_output"
+
+
+def rpm(w):
+    return w * 60 / (2 * math.pi)
+
+
+def available(w):
+    """BLDC torque-speed curve: stall torque -> 0 at no-load speed."""
+    return PEAK_TORQUE * max(0.0, min(1.0, 1.0 - abs(w) / NOLOAD_SPEED))
+
+
+print("\n" + "=" * 68)
+print("  AK70-10 KV100 — motor characterization, Isaac Sim 5.1 (USD build)")
+print("=" * 68, flush=True)
+
+# ---------------------------------------------------------------- world
+world = World(physics_dt=1 / HZ, rendering_dt=1 / 60, stage_units_in_meters=1.0)
+print("S2 world ok", flush=True)
+
+stage = get_current_stage()
+UsdGeom.Xform.Define(stage, "/World")
+
+# ------------------------------------------------------ articulation root
+root_prim = UsdGeom.Xform.Define(stage, ROOT).GetPrim()
+UsdPhysics.ArticulationRootAPI.Apply(root_prim)
+PhysxSchema.PhysxArticulationAPI.Apply(root_prim)
+print("S3 root ok", flush=True)
+
+# ------------------------------------------------------------ base link
+base = UsdGeom.Cylinder.Define(stage, BASE)
+base.CreateRadiusAttr(0.0445)
+base.CreateHeightAttr(0.05025)
+base.CreateAxisAttr("Z")
+base.CreateExtentAttr([(-0.0445, -0.0445, -0.0251), (0.0445, 0.0445, 0.0251)])
+bp = base.GetPrim()
+UsdPhysics.RigidBodyAPI.Apply(bp)
+bm = UsdPhysics.MassAPI.Apply(bp)
+bm.CreateMassAttr(0.45)
+bm.CreateDiagonalInertiaAttr(Gf.Vec3f(3.17468e-04, 3.17468e-04, 4.455562e-04))
+
+# pin the housing to the world (this is a dyno: the case does not move)
+fix = UsdPhysics.FixedJoint.Define(stage, ROOT + "/base_fix")
+fix.CreateBody1Rel().SetTargets([Sdf.Path(BASE)])
+print("S4 base ok", flush=True)
+
+# ---------------------------------------------------------- output link
+out = UsdGeom.Cylinder.Define(stage, OUTPUT)
+out.CreateRadiusAttr(0.030)
+out.CreateHeightAttr(0.012)
+out.CreateAxisAttr("Z")
+out.CreateExtentAttr([(-0.030, -0.030, -0.006), (0.030, 0.030, 0.006)])
+UsdGeom.Xformable(out).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, SHAFT_Z))
+op = out.GetPrim()
+UsdPhysics.RigidBodyAPI.Apply(op)
+om = UsdPhysics.MassAPI.Apply(op)
+om.CreateMassAttr(0.071)
+om.CreateDiagonalInertiaAttr(Gf.Vec3f(1.6827e-05, 1.6827e-05, 3.195e-05))
+print("S5 output ok", flush=True)
+
+# ---------------------------------------------------------- the joint
+rj = UsdPhysics.RevoluteJoint.Define(stage, JOINT)
+rj.CreateBody0Rel().SetTargets([Sdf.Path(BASE)])
+rj.CreateBody1Rel().SetTargets([Sdf.Path(OUTPUT)])
+rj.CreateAxisAttr("Z")
+rj.CreateLocalPos0Attr(Gf.Vec3f(0.0, 0.0, SHAFT_Z))
+rj.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
+rj.CreateLocalRot0Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+rj.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+# no lower/upper limit attrs -> continuous rotation
+
+jp = rj.GetPrim()
+
+# effort (torque) mode: a drive with zero gains and a force ceiling
+drive = UsdPhysics.DriveAPI.Apply(jp, "angular")
+drive.CreateTypeAttr("force")
+drive.CreateStiffnessAttr(0.0)
+drive.CreateDampingAttr(0.0)
+drive.CreateMaxForceAttr(PEAK_TORQUE)
+
+# QDD reflected inertia + back-drive friction
+pj = PhysxSchema.PhysxJointAPI.Apply(jp)
+pj.CreateArmatureAttr(ARMATURE)
+pj.CreateJointFrictionAttr(FRICTION)
+print("S6 joint ok", flush=True)
+
+# ------------------------------------------------------------ bring up
+robot = SingleArticulation(prim_path=ROOT, name="ak70_motor")
+world.scene.add(robot)
+world.reset()
+print("S7 RESET OK", flush=True)
+
+robot.initialize()
+print("S8 initialize ok", flush=True)
+
+ctrl = robot.get_articulation_controller()
+ctrl.set_gains(kps=np.array([0.0]), kds=np.array([0.0]))
+ctrl.set_max_efforts(np.array([PEAK_TORQUE]))
+try:
+    ctrl.switch_control_mode("effort")
+except Exception as e:
+    print(f"  (switch_control_mode: {type(e).__name__})")
+
+# -------------------------------------------------------- DIAGNOSTICS
+print("\n" + "-" * 68)
+print("  DIAGNOSTICS")
+print("-" * 68)
+print(f"  dof names   : {list(robot.dof_names)}")
+try:
+    kps, kds = ctrl.get_gains()
+    print(f"  gains Kp/Kd : {kps} / {kds}   <- must be 0")
+except Exception as e:
+    print(f"  gains       : ERR {e}")
+try:
+    print(f"  max efforts : {ctrl.get_max_efforts()}   <- must be 24.8")
+except Exception as e:
+    print(f"  max efforts : ERR {e}")
+print(f"  armature    : {pj.GetArmatureAttr().Get()}")
+print(f"  friction    : {pj.GetJointFrictionAttr().Get()}")
+print("-" * 68, flush=True)
+
+
+def run(seconds, cmd_fn, w0=0.0):
+    robot.set_joint_velocities(np.array([w0]))
+    n, log = int(seconds * HZ), []
+    for i in range(n):
+        t = i / HZ
+        w = float(robot.get_joint_velocities()[0])
+        lim = available(w)
+        tau = max(-lim, min(lim, cmd_fn(t, w)))
+        robot.apply_action(ArticulationAction(joint_efforts=np.array([tau])))
+        world.step(render=False)
+        log.append((t, w, tau))
+    return log
+
+
+# ---- 1  spin-up at peak torque
+T1 = run(0.5, lambda t, w: PEAK_TORQUE)
+w_term = T1[-1][1]
+t95 = next((r[0] for r in T1 if abs(r[1]) >= 0.95 * abs(w_term)), None) \
+      if abs(w_term) > 1e-6 else None
+print(f"\n[1]  SPIN-UP AT PEAK TORQUE (24.8 Nm)")
+print(f"     terminal speed : {w_term:.2f} rad/s = {rpm(w_term):.0f} rpm")
+if t95:
+    print(f"     time to 95%    : {t95*1000:.0f} ms")
+print(f"     theory accel   : {(PEAK_TORQUE-FRICTION)/ARMATURE:.0f} rad/s2", flush=True)
+
+# ---- 2  spin-up at rated torque
+T2 = run(0.5, lambda t, w: RATED_TORQUE)
+print(f"\n[2]  SPIN-UP AT RATED TORQUE (8.3 Nm)")
+print(f"     terminal speed : {rpm(T2[-1][1]):.0f} rpm")
+print(f"     current        : {RATED_TORQUE/KT_OUT:.1f} A  (datasheet 7.2 A)", flush=True)
+
+# ---- 3  torque steps
+def steps(t, w):
+    if t < 0.04:
+        return 5.0
+    if t < 0.08:
+        return 15.0
+    if t < 0.12:
+        return 0.0
+    return -8.0
+
+
+T3 = run(0.20, steps)
+print(f"\n[3]  TORQUE STEPS (5 -> 15 -> 0 -> -8 Nm, 40 ms each)")
+print(f"       t[ms]  speed[rpm]  tau[Nm]")
+for mk in (0.039, 0.079, 0.119, 0.199):
+    k = int(mk * HZ)
+    print(f"      {mk*1000:5.0f}  {rpm(T3[k][1]):9.0f}  {T3[k][2]:+7.2f}")
+
+# ---- 4  coast-down
+T4 = run(1.0, lambda t, w: 0.0, w0=w_term)
+t_stop = next((r[0] for r in T4 if abs(r[1]) < 0.05), None)
+print(f"\n[4]  COAST-DOWN (torque cut)")
+if t_stop:
+    print(f"     from {rpm(w_term):.0f} rpm -> stop in {t_stop*1000:.0f} ms")
+else:
+    print(f"     still at {rpm(T4[-1][1]):.0f} rpm after 1 s")
+print(f"     theory decel   : {FRICTION/ARMATURE:.0f} rad/s2", flush=True)
+
+# ---- 5  torque-speed curve
+ws = np.linspace(0, NOLOAD_SPEED, 100)
+tq = [available(w) for w in ws]
+pw = [t * w for t, w in zip(tq, ws)]
+i = int(np.argmax(pw))
+print(f"\n[5]  TORQUE-SPEED CURVE")
+print(f"     stall      : {tq[0]:.1f} Nm @ 0 rpm")
+print(f"     no-load    : {rpm(ws[-1]):.0f} rpm @ 0 Nm")
+print(f"     peak power : {pw[i]:.0f} W @ {rpm(ws[i]):.0f} rpm")
+
+print("\n" + "=" * 68)
+print(f"  RESULT: unloaded shaft settles at {rpm(w_term):.0f} rpm")
+print(f"  (independent calculation predicts ~452 rpm)")
+print("=" * 68)
+
+if abs(rpm(w_term)) < 50:
+    print("\n  !! SHAFT NOT SPINNING — physics is not stepping the joint.")
+elif abs(rpm(w_term) - 452) < 60:
+    print("\n  ** Isaac Sim agrees with the independent calculation. **")
+
+with open("/root/motor_isaac.csv", "w", newline="") as f:
+    wr = csv.writer(f)
+    wr.writerow(["test", "t_s", "omega_rad_s", "rpm", "tau_Nm", "current_A"])
+    for nm, lg in (("peak", T1), ("rated", T2), ("steps", T3), ("coast", T4)):
+        for r in lg[::5]:
+            wr.writerow([nm, f"{r[0]:.4f}", f"{r[1]:.4f}", f"{rpm(r[1]):.1f}",
+                         f"{r[2]:.4f}", f"{r[2]/KT_OUT:.2f}"])
+print("\n  CSV -> /root/motor_isaac.csv", flush=True)
+
+import os
+os._exit(0)
